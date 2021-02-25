@@ -36,6 +36,28 @@ impl Dispute {
     }
 }
 
+pub struct Account {
+    pub client_id: ClientId,
+    pub available: Decimal,
+    pub held: Decimal,
+    pub locked: bool,
+    transaction_history: HashMap<TransactionId, Transaction>,
+    open_disputes: HashSet<Dispute>,
+}
+
+impl Account {
+    pub fn new(client_id: ClientId) -> Self {
+        Self {
+            client_id,
+            available: Decimal::zero(),
+            held: Decimal::zero(),
+            locked: false,
+            transaction_history: HashMap::new(),
+            open_disputes: HashSet::new(),
+        }
+    }
+}
+
 pub struct Bank {
     client_accounts: HashMap<ClientId, Account>,
 }
@@ -122,6 +144,33 @@ impl Bank {
         Ok(())
     }
 
+    /// Resolve a previously disputed transaction
+    /// If the transaction does not exist, or this transaction was never
+    /// previously disputed this will be ignored.
+    /// This can fail if moving the disputed funds causes an overflow
+    pub fn resolve_dispute(
+        &mut self,
+        client_id: ClientId,
+        dispute: Dispute,
+    ) -> Result<(), Box<dyn Error>> {
+        let account = self.account(client_id);
+        // Only handle disputes that have been made already and only if the transaction has been enacted.
+        if !account.open_disputes.contains(&dispute)
+            || !account
+            .transaction_history
+            .contains_key(&dispute.transaction_id)
+        {
+            return Ok(());
+        }
+        let transaction_amount = account.transaction_history[&dispute.transaction_id].amount;
+        // no matter if this is a withdrawal or a deposit we need to
+        // move the funds from held into available
+        let disputed_amount = -transaction_amount.abs();
+        Bank::move_funds_from_available_to_held(account, disputed_amount)?;
+        self.account(client_id).open_disputes.remove(&dispute);
+        Ok(())
+    }
+
     fn move_funds_from_available_to_held(
         account: &mut Account,
         amount: Decimal,
@@ -143,28 +192,6 @@ impl Bank {
         self.client_accounts
             .entry(client_id)
             .or_insert(Account::new(client_id))
-    }
-}
-
-pub struct Account {
-    pub client_id: ClientId,
-    pub available: Decimal,
-    pub held: Decimal,
-    pub locked: bool,
-    transaction_history: HashMap<TransactionId, Transaction>,
-    open_disputes: HashSet<Dispute>,
-}
-
-impl Account {
-    pub fn new(client_id: ClientId) -> Self {
-        Self {
-            client_id,
-            available: Decimal::zero(),
-            held: Decimal::zero(),
-            locked: false,
-            transaction_history: HashMap::new(),
-            open_disputes: HashSet::new(),
-        }
     }
 }
 
@@ -377,6 +404,131 @@ mod test {
                 .get(&transaction_id)
                 .unwrap(),
             huge_deposit
+        );
+        assert!(bank.account(client).open_disputes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_dispute_fails_if_causes_overflow_in_available_and_dispute_is_not_resolved(
+    ) -> Result<(), Box<dyn Error>> {
+        let mut bank = Bank::new();
+        let client = ClientId(1);
+        let max_value = Decimal::max_value();
+        let transaction_id1 = TransactionId(1);
+        let huge_deposit = Transaction::new(transaction_id1, max_value);
+        let transaction_id2 = TransactionId(2);
+        let huge_deposit2 = Transaction::new(transaction_id2, max_value);
+        let dispute = Dispute::new(transaction_id1);
+
+        bank.transact(client, huge_deposit.clone())?;
+        bank.handle_dispute(client, dispute)?;
+        bank.transact(client,huge_deposit2.clone())?;
+
+        assert!(bank.resolve_dispute(client, dispute).is_err());
+        assert_eq!(bank.account(client).available, max_value);
+        assert_eq!(bank.account(client).held, max_value);
+        assert_eq!(
+            *bank
+                .account(client)
+                .transaction_history
+                .get(&transaction_id1)
+                .unwrap(),
+            huge_deposit
+        );
+        assert_eq!(
+            *bank
+                .account(client)
+                .transaction_history
+                .get(&transaction_id2)
+                .unwrap(),
+            huge_deposit2
+        );
+        assert!(bank.account(client).open_disputes.contains(&dispute));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_dispute_ignores_if_transaction_does_not_exist() -> Result<(), Box<dyn Error>> {
+        let mut bank = Bank::new();
+        let client = ClientId(1);
+        bank.resolve_dispute(client, Dispute::new(TransactionId(1)))?;
+
+        assert_eq!(bank.account(client).available, Decimal::zero());
+        assert_eq!(bank.account(client).held, Decimal::zero());
+        assert!(bank.account(client).open_disputes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_dispute_ignores_if_transaction_is_not_disputed() -> Result<(), Box<dyn Error>> {
+        let mut bank = Bank::new();
+        let client = ClientId(1);
+        let amount = Decimal::max_value();
+        let transaction_id = TransactionId(1);
+        let deposit = Transaction::new(transaction_id, amount);
+
+        bank.transact(client, deposit.clone())?;
+        bank.resolve_dispute(client, Dispute::new(TransactionId(1)))?;
+
+        assert_eq!(bank.account(client).available, amount);
+        assert_eq!(bank.account(client).held, Decimal::zero());
+        assert!(bank.account(client).open_disputes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_dispute_correctly_resolves_disputed_withdrawal(
+    ) -> Result<(), Box<dyn Error>> {
+        let mut bank = Bank::new();
+        let client = ClientId(1);
+        let amount = Decimal::max_value();
+        let transaction_id = TransactionId(1);
+        let withdrawal = Transaction::new(transaction_id, -amount);
+        let dispute = Dispute::new(transaction_id);
+
+        bank.account(client).available = amount;
+        bank.transact(client, withdrawal.clone())?;
+        bank.handle_dispute(client, dispute.clone())?;
+        bank.resolve_dispute(client, dispute)?;
+
+        assert_eq!(bank.account(client).available, Decimal::zero());
+        assert_eq!(bank.account(client).held, Decimal::zero());
+        assert_eq!(
+            *bank
+                .account(client)
+                .transaction_history
+                .get(&transaction_id)
+                .unwrap(),
+            withdrawal
+        );
+        assert!(bank.account(client).open_disputes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_dispute_correctly_resolves_disputed_transaction(
+    ) -> Result<(), Box<dyn Error>> {
+        let mut bank = Bank::new();
+        let client = ClientId(1);
+        let amount = Decimal::max_value();
+        let transaction_id = TransactionId(1);
+        let deposit = Transaction::new(transaction_id, amount);
+        let dispute = Dispute::new(transaction_id);
+
+        bank.transact(client, deposit.clone())?;
+        bank.handle_dispute(client, dispute.clone())?;
+        bank.resolve_dispute(client, dispute)?;
+
+        assert_eq!(bank.account(client).available, amount);
+        assert_eq!(bank.account(client).held, Decimal::zero());
+        assert_eq!(
+            *bank
+                .account(client)
+                .transaction_history
+                .get(&transaction_id)
+                .unwrap(),
+            deposit
         );
         assert!(bank.account(client).open_disputes.is_empty());
         Ok(())

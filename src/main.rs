@@ -42,6 +42,7 @@ enum TransactionRecordType {
     DEPOSIT,
     WITHDRAWAL,
     DISPUTE,
+    RESOLVE,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +89,15 @@ fn enact_transactions(filename: String) -> Result<(), Box<dyn Error>> {
                 bank.handle_dispute(
                     ClientId(transaction.client),
                     Dispute::new(TransactionId(transaction.tx)),
+                )?;
+            }
+            TransactionRecordType::RESOLVE => {
+                if transaction.amount.is_some() {
+                    return Err(invalid_data());
+                }
+                bank.resolve_dispute(
+                    ClientId(transaction.client),
+                    Dispute::new(TransactionId(transaction.tx))
                 )?;
             }
         }
