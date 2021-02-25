@@ -1,13 +1,13 @@
 use argh::FromArgs;
 use csv::{ReaderBuilder, Trim, Writer};
 use rust_decimal::prelude::*;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 
 mod bank;
 
+use crate::bank::{Bank, ClientId, Dispute, Transaction, TransactionId};
 use simple_error::SimpleError;
-use crate::bank::{Bank, Transaction};
 
 #[derive(FromArgs)]
 /// A program for enacting a CSV files of transactions over multiple accounts
@@ -20,9 +20,7 @@ struct Arguments {
 fn main() {
     let arguments: Arguments = argh::from_env();
     std::process::exit(match enact_transactions(arguments.input_file) {
-        Ok(_) => {
-                0
-        }
+        Ok(_) => 0,
         Err(e) => {
             eprintln!("Failed to handle given file {}", e);
             1
@@ -38,11 +36,12 @@ struct TransactionRecord {
     amount: Option<Decimal>,
 }
 
-#[derive(Debug,Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum TransactionRecordType {
     DEPOSIT,
     WITHDRAWAL,
+    DISPUTE,
 }
 
 #[derive(Debug, Serialize)]
@@ -55,39 +54,54 @@ struct AccountRecord {
 }
 
 fn enact_transactions(filename: String) -> Result<(), Box<dyn Error>> {
-    let mut reader = ReaderBuilder::new()
-        .trim(Trim::All)
-        .from_path(filename)?;
+    let mut reader = ReaderBuilder::new().trim(Trim::All).from_path(filename)?;
     let mut bank: Bank = Bank::new();
     for result in reader.deserialize() {
         let transaction: TransactionRecord = result?;
         match transaction.r#type {
-            TransactionRecordType::DEPOSIT  => {
+            TransactionRecordType::DEPOSIT => {
                 let amount = transaction.amount.ok_or_else(missing_data)?;
                 if amount < Decimal::zero() {
                     return Err(invalid_data());
                 } else {
-                    bank.transact(transaction.client, Transaction::new(transaction.tx, amount))?;
+                    bank.transact(
+                        ClientId(transaction.client),
+                        Transaction::new(TransactionId(transaction.tx), amount),
+                    )?;
                 }
-            },
+            }
             TransactionRecordType::WITHDRAWAL => {
-                    let amount = transaction.amount.ok_or_else(missing_data)?;
-                    if amount < Decimal::zero() {
-                        return Err(invalid_data());
-                    } else {
-                        bank.transact(transaction.client, Transaction::new(transaction.tx, -amount))?;
-                    }
-            },
+                let amount = transaction.amount.ok_or_else(missing_data)?;
+                if amount < Decimal::zero() {
+                    return Err(invalid_data());
+                } else {
+                    bank.transact(
+                        ClientId(transaction.client),
+                        Transaction::new(TransactionId(transaction.tx), -amount),
+                    )?;
+                }
+            }
+            TransactionRecordType::DISPUTE => {
+                if transaction.amount.is_some() {
+                    return Err(invalid_data());
+                }
+                bank.handle_dispute(
+                    ClientId(transaction.client),
+                    Dispute::new(TransactionId(transaction.tx)),
+                )?;
+            }
         }
     }
     let mut writer = Writer::from_writer(std::io::stdout());
     for account in bank.get_accounts() {
         writer.serialize(AccountRecord {
-            client: account.client_id,
+            client: account.client_id.0,
             available: account.available,
-            held: Decimal::zero(),
-            total: account.available + Decimal::zero(),
-            locked: false,
+            held: account.held,
+            total: account.available.checked_add(account.held).ok_or_else(|| {
+                SimpleError::new("Overflow calculating total funds associated to account")
+            })?,
+            locked: account.locked,
         })?;
     }
     Ok(())
