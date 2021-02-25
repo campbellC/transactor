@@ -140,7 +140,7 @@ impl Bank {
         // withhold the absolute value of the funds
         let disputed_amount = transaction_amount.abs();
         Bank::move_funds_from_available_to_held(account, disputed_amount)?;
-        self.account(client_id).open_disputes.insert(dispute);
+        account.open_disputes.insert(dispute);
         Ok(())
     }
 
@@ -167,7 +167,33 @@ impl Bank {
         // move the funds from held into available
         let disputed_amount = -transaction_amount.abs();
         Bank::move_funds_from_available_to_held(account, disputed_amount)?;
-        self.account(client_id).open_disputes.remove(&dispute);
+        account.open_disputes.remove(&dispute);
+        Ok(())
+    }
+
+    /// Chargeback a disputed transaction
+    /// If the transaction does not exist, or this transaction was never
+    /// previously disputed this will be ignored.
+    /// This can fail if removing the funds causes overflow.
+    pub fn chargeback(
+        &mut self,
+        client_id: ClientId,
+        dispute: Dispute,
+    ) -> Result<(), Box<dyn Error>> {
+        let account = self.account(client_id);
+        // Only handle disputes that have been made already and only if the transaction has been enacted.
+        if !account.open_disputes.contains(&dispute)
+            || !account
+            .transaction_history
+            .contains_key(&dispute.transaction_id)
+        {
+            return Ok(());
+        }
+        let transaction_amount = account.transaction_history[&dispute.transaction_id].amount;
+        let disputed_amount = transaction_amount.abs();
+        account.held = account.held.checked_sub(disputed_amount).ok_or_else(|| SimpleError::new("Overflow"))?;
+        account.locked = true;
+        account.open_disputes.remove(&dispute);
         Ok(())
     }
 
@@ -276,7 +302,7 @@ mod test {
     }
 
     #[test]
-    fn deposit_to_locked_account_fails_and_is_not_recorded() -> Result<(), Box<dyn Error>> {
+    fn deposit_to_locked_account_is_ignored_and_is_not_recorded() -> Result<(), Box<dyn Error>> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let transaction_id = TransactionId(1);
@@ -531,6 +557,62 @@ mod test {
             deposit
         );
         assert!(bank.account(client).open_disputes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn chargeback_correctly_pulls_back_disputed_transaction(
+    ) -> Result<(), Box<dyn Error>> {
+        let mut bank = Bank::new();
+        let client = ClientId(1);
+        let amount = Decimal::max_value();
+        let transaction_id = TransactionId(1);
+        let deposit = Transaction::new(transaction_id, amount);
+        let dispute = Dispute::new(transaction_id);
+
+        bank.transact(client, deposit.clone())?;
+        bank.handle_dispute(client, dispute.clone())?;
+        bank.chargeback(client, dispute)?;
+
+        assert_eq!(bank.account(client).available, Decimal::zero());
+        assert_eq!(bank.account(client).held, Decimal::zero());
+        assert_eq!(
+            *bank
+                .account(client)
+                .transaction_history
+                .get(&transaction_id)
+                .unwrap(),
+            deposit
+        );
+        assert!(bank.account(client).open_disputes.is_empty());
+        assert!(bank.account(client).locked);
+        Ok(())
+    }
+
+    #[test]
+    fn chargeback_correctly_ignored_if_transaction_not_disputed(
+    ) -> Result<(), Box<dyn Error>> {
+        let mut bank = Bank::new();
+        let client = ClientId(1);
+        let amount = Decimal::max_value();
+        let transaction_id = TransactionId(1);
+        let deposit = Transaction::new(transaction_id, amount);
+
+        bank.transact(client, deposit.clone())?;
+        bank.chargeback(client, Dispute::new(transaction_id))?;
+
+        assert_eq!(bank.account(client).available, amount);
+        assert_eq!(bank.account(client).held, Decimal::zero());
+        assert_eq!(
+            *bank
+                .account(client)
+                .transaction_history
+                .get(&transaction_id)
+                .unwrap(),
+            deposit
+        );
+        assert!(bank.account(client).open_disputes.is_empty());
+        assert!(!bank.account(client).locked);
         Ok(())
     }
 }

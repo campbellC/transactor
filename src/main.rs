@@ -43,6 +43,7 @@ enum TransactionRecordType {
     WITHDRAWAL,
     DISPUTE,
     RESOLVE,
+    CHARGEBACK,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,17 +101,26 @@ fn enact_transactions(filename: String) -> Result<(), Box<dyn Error>> {
                     Dispute::new(TransactionId(transaction.tx))
                 )?;
             }
+            TransactionRecordType::CHARGEBACK => {
+                if transaction.amount.is_some() {
+                    return Err(invalid_data());
+                }
+                bank.chargeback(
+                    ClientId(transaction.client),
+                    Dispute::new(TransactionId(transaction.tx))
+                )?;
+            }
         }
     }
     let mut writer = Writer::from_writer(std::io::stdout());
     for account in bank.get_accounts() {
         writer.serialize(AccountRecord {
             client: account.client_id.0,
-            available: account.available,
-            held: account.held,
+            available: account.available.round_dp(4).normalize(),
+            held: account.held.round_dp(4).normalize(),
             total: account.available.checked_add(account.held).ok_or_else(|| {
                 SimpleError::new("Overflow calculating total funds associated to account")
-            })?,
+            })?.round_dp(4).normalize(),
             locked: account.locked,
         })?;
     }
