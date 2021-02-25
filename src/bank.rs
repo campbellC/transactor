@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::error::Error;
 
+use crate::error::{TransactorError, TransactorError::*};
 use rust_decimal::prelude::*;
-use simple_error::SimpleError;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct TransactionId(pub u32);
@@ -25,24 +24,13 @@ impl Transaction {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
-pub struct Dispute {
-    transaction_id: TransactionId,
-}
-
-impl Dispute {
-    pub fn new(transaction_id: TransactionId) -> Self {
-        Self { transaction_id }
-    }
-}
-
 pub struct Account {
     pub client_id: ClientId,
     pub available: Decimal,
     pub held: Decimal,
     pub locked: bool,
     transaction_history: HashMap<TransactionId, Transaction>,
-    open_disputes: HashSet<Dispute>,
+    disputed_transactions: HashSet<TransactionId>,
 }
 
 impl Account {
@@ -53,7 +41,7 @@ impl Account {
             held: Decimal::zero(),
             locked: false,
             transaction_history: HashMap::new(),
-            open_disputes: HashSet::new(),
+            disputed_transactions: HashSet::new(),
         }
     }
 }
@@ -83,7 +71,7 @@ impl Bank {
         &mut self,
         client_id: ClientId,
         transaction: Transaction,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), TransactorError> {
         let account = self.account(client_id);
 
         if account.locked {
@@ -94,17 +82,13 @@ impl Bank {
             .transaction_history
             .contains_key(&transaction.transaction_id)
         {
-            return Err(Box::new(SimpleError::new(
-                "Transaction attempted twice with same id",
-            )));
+            return Err(TransactionIdReuse);
         }
 
         let new_balance = account
             .available
             .checked_add(transaction.amount)
-            .ok_or_else(|| {
-                SimpleError::new("Overflow occurred performing transaction on account")
-            })?;
+            .ok_or_else(|| Overflow)?;
         // We only allow the transaction to occur if it is depositing or it leaves the account in
         // the positive
         let zero = Decimal::zero();
@@ -121,26 +105,24 @@ impl Bank {
     /// If the transaction does not exist this will be ignored.
     /// If the transaction has already been disputed this will be ignored.
     /// This can fail if moving the disputed funds causes an overflow
-    pub fn handle_dispute(
+    pub fn dispute_transaction(
         &mut self,
         client_id: ClientId,
-        dispute: Dispute,
-    ) -> Result<(), Box<dyn Error>> {
+        dispute: TransactionId,
+    ) -> Result<(), TransactorError> {
         let account = self.account(client_id);
         // Only handle disputes that have not been handled and only if the transaction has been enacted.
-        if account.open_disputes.contains(&dispute)
-            || !account
-                .transaction_history
-                .contains_key(&dispute.transaction_id)
+        if account.disputed_transactions.contains(&dispute)
+            || !account.transaction_history.contains_key(&dispute)
         {
             return Ok(());
         }
-        let transaction_amount = account.transaction_history[&dispute.transaction_id].amount;
+        let transaction_amount = account.transaction_history[&dispute].amount;
         // no matter if this is a withdrawal or a deposit we need to
         // withhold the absolute value of the funds
         let disputed_amount = transaction_amount.abs();
         Bank::move_funds_from_available_to_held(account, disputed_amount)?;
-        account.open_disputes.insert(dispute);
+        account.disputed_transactions.insert(dispute);
         Ok(())
     }
 
@@ -148,26 +130,28 @@ impl Bank {
     /// If the transaction does not exist, or this transaction was never
     /// previously disputed this will be ignored.
     /// This can fail if moving the disputed funds causes an overflow
-    pub fn resolve_dispute(
+    pub fn resolve_disputed_transaction(
         &mut self,
         client_id: ClientId,
-        dispute: Dispute,
-    ) -> Result<(), Box<dyn Error>> {
+        disputed_transaction: TransactionId,
+    ) -> Result<(), TransactorError> {
         let account = self.account(client_id);
         // Only handle disputes that have been made already and only if the transaction has been enacted.
-        if !account.open_disputes.contains(&dispute)
+        if !account
+            .disputed_transactions
+            .contains(&disputed_transaction)
             || !account
-            .transaction_history
-            .contains_key(&dispute.transaction_id)
+                .transaction_history
+                .contains_key(&disputed_transaction)
         {
             return Ok(());
         }
-        let transaction_amount = account.transaction_history[&dispute.transaction_id].amount;
+        let transaction_amount = account.transaction_history[&disputed_transaction].amount;
         // no matter if this is a withdrawal or a deposit we need to
         // move the funds from held into available
         let disputed_amount = -transaction_amount.abs();
         Bank::move_funds_from_available_to_held(account, disputed_amount)?;
-        account.open_disputes.remove(&dispute);
+        account.disputed_transactions.remove(&disputed_transaction);
         Ok(())
     }
 
@@ -178,29 +162,34 @@ impl Bank {
     pub fn chargeback(
         &mut self,
         client_id: ClientId,
-        dispute: Dispute,
-    ) -> Result<(), Box<dyn Error>> {
+        disputed_transaction: TransactionId,
+    ) -> Result<(), TransactorError> {
         let account = self.account(client_id);
         // Only handle disputes that have been made already and only if the transaction has been enacted.
-        if !account.open_disputes.contains(&dispute)
+        if !account
+            .disputed_transactions
+            .contains(&disputed_transaction)
             || !account
-            .transaction_history
-            .contains_key(&dispute.transaction_id)
+                .transaction_history
+                .contains_key(&disputed_transaction)
         {
             return Ok(());
         }
-        let transaction_amount = account.transaction_history[&dispute.transaction_id].amount;
+        let transaction_amount = account.transaction_history[&disputed_transaction].amount;
         let disputed_amount = transaction_amount.abs();
-        account.held = account.held.checked_sub(disputed_amount).ok_or_else(|| SimpleError::new("Overflow"))?;
+        account.held = account
+            .held
+            .checked_sub(disputed_amount)
+            .ok_or_else(|| Overflow)?;
         account.locked = true;
-        account.open_disputes.remove(&dispute);
+        account.disputed_transactions.remove(&disputed_transaction);
         Ok(())
     }
 
     fn move_funds_from_available_to_held(
         account: &mut Account,
         amount: Decimal,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), TransactorError> {
         let new_available = account.available.checked_sub(amount);
         let new_held = account.held.checked_add(amount);
         return if let (Some(available), Some(held)) = (new_available, new_held) {
@@ -208,9 +197,7 @@ impl Bank {
             account.held = held;
             Ok(())
         } else {
-            return Err(Box::new(SimpleError::new(
-                "Overflow on moving between available and held",
-            )));
+            return Err(Overflow);
         };
     }
 
@@ -227,7 +214,7 @@ mod test {
 
     #[test]
     fn do_not_withdraw_into_negative_amount_and_transaction_is_not_recorded(
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), TransactorError> {
         let client = ClientId(1);
         let mut bank = Bank::new();
         bank.transact(
@@ -240,7 +227,7 @@ mod test {
     }
 
     #[test]
-    fn transaction_for_positive_adds_to_total_and_is_recorded() -> Result<(), Box<dyn Error>> {
+    fn transaction_for_positive_adds_to_total_and_is_recorded() -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let tx = TransactionId(2);
@@ -255,7 +242,7 @@ mod test {
     }
 
     #[test]
-    fn transaction_for_negative_lowers_balance_and_is_recorded() -> Result<(), Box<dyn Error>> {
+    fn transaction_for_negative_lowers_balance_and_is_recorded() -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let transaction_id1 = TransactionId(1);
@@ -287,7 +274,8 @@ mod test {
     }
 
     #[test]
-    fn account_deposit_with_huge_numbers_fails_and_is_not_recorded() -> Result<(), Box<dyn Error>> {
+    fn account_deposit_with_huge_numbers_fails_and_is_not_recorded() -> Result<(), TransactorError>
+    {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let max_decimal = Decimal::max_value();
@@ -302,7 +290,7 @@ mod test {
     }
 
     #[test]
-    fn deposit_to_locked_account_is_ignored_and_is_not_recorded() -> Result<(), Box<dyn Error>> {
+    fn deposit_to_locked_account_is_ignored_and_is_not_recorded() -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let transaction_id = TransactionId(1);
@@ -314,28 +302,27 @@ mod test {
     }
 
     #[test]
-    fn dispute_transaction_ignored_if_transaction_does_not_exist() -> Result<(), Box<dyn Error>> {
+    fn dispute_transaction_ignored_if_transaction_does_not_exist() -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
-        bank.handle_dispute(client, Dispute::new(TransactionId(1)))?;
+        bank.dispute_transaction(client, TransactionId(1))?;
 
         assert_eq!(bank.account(client).available, Decimal::zero());
         assert_eq!(bank.account(client).held, Decimal::zero());
-        assert!(bank.account(client).open_disputes.is_empty());
+        assert!(bank.account(client).disputed_transactions.is_empty());
         Ok(())
     }
 
     #[test]
-    fn dispute_positive_transaction_moves_funds_into_held() -> Result<(), Box<dyn Error>> {
+    fn dispute_positive_transaction_moves_funds_into_held() -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let disputed_amount = Decimal::new(1, 1);
         let transaction_id = TransactionId(1);
         let transaction = Transaction::new(transaction_id, disputed_amount);
-        let dispute = Dispute::new(transaction_id);
 
         bank.transact(client, transaction.clone())?;
-        bank.handle_dispute(client, dispute)?;
+        bank.dispute_transaction(client, transaction_id)?;
 
         assert_eq!(bank.account(client).available, Decimal::zero());
         assert_eq!(bank.account(client).held, disputed_amount);
@@ -347,23 +334,25 @@ mod test {
                 .unwrap(),
             transaction
         );
-        assert!(bank.account(client).open_disputes.contains(&dispute));
+        assert!(bank
+            .account(client)
+            .disputed_transactions
+            .contains(&transaction_id));
         Ok(())
     }
 
     #[test]
-    fn dispute_negative_transaction_moves_funds_into_held() -> Result<(), Box<dyn Error>> {
+    fn dispute_negative_transaction_moves_funds_into_held() -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let disputed_amount = Decimal::new(1, 1);
         bank.account(client).available = disputed_amount;
         let transaction_id = TransactionId(1);
         let transaction = Transaction::new(transaction_id, -disputed_amount);
-        let dispute = Dispute::new(transaction_id);
 
         bank.transact(client, transaction.clone())?;
         assert_eq!(bank.account(client).available, Decimal::zero());
-        bank.handle_dispute(client, dispute)?;
+        bank.dispute_transaction(client, transaction_id)?;
 
         assert_eq!(bank.account(client).available, -disputed_amount);
         assert_eq!(bank.account(client).held, disputed_amount);
@@ -375,24 +364,26 @@ mod test {
                 .unwrap(),
             transaction
         );
-        assert!(bank.account(client).open_disputes.contains(&dispute));
+        assert!(bank
+            .account(client)
+            .disputed_transactions
+            .contains(&transaction_id));
         Ok(())
     }
 
     #[test]
     fn dispute_transaction_fails_if_causes_overflow_in_held_and_dispute_is_not_recorded(
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let max_value = Decimal::max_value();
         let transaction_id = TransactionId(1);
         let transaction = Transaction::new(transaction_id, max_value);
-        let dispute = Dispute::new(transaction_id);
         bank.account(client).held = max_value;
 
         bank.transact(client, transaction.clone())?;
 
-        assert!(bank.handle_dispute(client, dispute).is_err());
+        assert!(bank.dispute_transaction(client, transaction_id).is_err());
         assert_eq!(bank.account(client).available, max_value);
         assert_eq!(bank.account(client).held, max_value);
         assert_eq!(
@@ -403,23 +394,22 @@ mod test {
                 .unwrap(),
             transaction
         );
-        assert!(bank.account(client).open_disputes.is_empty());
+        assert!(bank.account(client).disputed_transactions.is_empty());
         Ok(())
     }
 
     #[test]
     fn dispute_transaction_fails_if_causes_overflow_in_available_and_dispute_is_not_recorded(
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let max_value = Decimal::max_value();
         let transaction_id = TransactionId(1);
         let huge_deposit = Transaction::new(transaction_id, max_value);
-        let dispute = Dispute::new(transaction_id);
 
         bank.transact(client, huge_deposit.clone())?;
         bank.account(client).available = -max_value;
-        assert!(bank.handle_dispute(client, dispute).is_err());
+        assert!(bank.dispute_transaction(client, transaction_id).is_err());
 
         assert_eq!(bank.account(client).available, -max_value);
         assert_eq!(bank.account(client).held, Decimal::zero());
@@ -431,13 +421,13 @@ mod test {
                 .unwrap(),
             huge_deposit
         );
-        assert!(bank.account(client).open_disputes.is_empty());
+        assert!(bank.account(client).disputed_transactions.is_empty());
         Ok(())
     }
 
     #[test]
     fn resolve_dispute_fails_if_causes_overflow_in_available_and_dispute_is_not_resolved(
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let max_value = Decimal::max_value();
@@ -445,13 +435,14 @@ mod test {
         let huge_deposit = Transaction::new(transaction_id1, max_value);
         let transaction_id2 = TransactionId(2);
         let huge_deposit2 = Transaction::new(transaction_id2, max_value);
-        let dispute = Dispute::new(transaction_id1);
 
         bank.transact(client, huge_deposit.clone())?;
-        bank.handle_dispute(client, dispute)?;
-        bank.transact(client,huge_deposit2.clone())?;
+        bank.dispute_transaction(client, transaction_id1)?;
+        bank.transact(client, huge_deposit2.clone())?;
 
-        assert!(bank.resolve_dispute(client, dispute).is_err());
+        assert!(bank
+            .resolve_disputed_transaction(client, transaction_id1)
+            .is_err());
         assert_eq!(bank.account(client).available, max_value);
         assert_eq!(bank.account(client).held, max_value);
         assert_eq!(
@@ -470,24 +461,27 @@ mod test {
                 .unwrap(),
             huge_deposit2
         );
-        assert!(bank.account(client).open_disputes.contains(&dispute));
+        assert!(bank
+            .account(client)
+            .disputed_transactions
+            .contains(&transaction_id1));
         Ok(())
     }
 
     #[test]
-    fn resolve_dispute_ignores_if_transaction_does_not_exist() -> Result<(), Box<dyn Error>> {
+    fn resolve_dispute_ignores_if_transaction_does_not_exist() -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
-        bank.resolve_dispute(client, Dispute::new(TransactionId(1)))?;
+        bank.resolve_disputed_transaction(client, TransactionId(1))?;
 
         assert_eq!(bank.account(client).available, Decimal::zero());
         assert_eq!(bank.account(client).held, Decimal::zero());
-        assert!(bank.account(client).open_disputes.is_empty());
+        assert!(bank.account(client).disputed_transactions.is_empty());
         Ok(())
     }
 
     #[test]
-    fn resolve_dispute_ignores_if_transaction_is_not_disputed() -> Result<(), Box<dyn Error>> {
+    fn resolve_dispute_ignores_if_transaction_is_not_disputed() -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let amount = Decimal::max_value();
@@ -495,28 +489,26 @@ mod test {
         let deposit = Transaction::new(transaction_id, amount);
 
         bank.transact(client, deposit.clone())?;
-        bank.resolve_dispute(client, Dispute::new(TransactionId(1)))?;
+        bank.resolve_disputed_transaction(client, transaction_id)?;
 
         assert_eq!(bank.account(client).available, amount);
         assert_eq!(bank.account(client).held, Decimal::zero());
-        assert!(bank.account(client).open_disputes.is_empty());
+        assert!(bank.account(client).disputed_transactions.is_empty());
         Ok(())
     }
 
     #[test]
-    fn resolve_dispute_correctly_resolves_disputed_withdrawal(
-    ) -> Result<(), Box<dyn Error>> {
+    fn resolve_dispute_correctly_resolves_disputed_withdrawal() -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let amount = Decimal::max_value();
         let transaction_id = TransactionId(1);
         let withdrawal = Transaction::new(transaction_id, -amount);
-        let dispute = Dispute::new(transaction_id);
 
         bank.account(client).available = amount;
         bank.transact(client, withdrawal.clone())?;
-        bank.handle_dispute(client, dispute.clone())?;
-        bank.resolve_dispute(client, dispute)?;
+        bank.dispute_transaction(client, transaction_id.clone())?;
+        bank.resolve_disputed_transaction(client, transaction_id)?;
 
         assert_eq!(bank.account(client).available, Decimal::zero());
         assert_eq!(bank.account(client).held, Decimal::zero());
@@ -528,23 +520,21 @@ mod test {
                 .unwrap(),
             withdrawal
         );
-        assert!(bank.account(client).open_disputes.is_empty());
+        assert!(bank.account(client).disputed_transactions.is_empty());
         Ok(())
     }
 
     #[test]
-    fn resolve_dispute_correctly_resolves_disputed_transaction(
-    ) -> Result<(), Box<dyn Error>> {
+    fn resolve_dispute_correctly_resolves_disputed_transaction() -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let amount = Decimal::max_value();
         let transaction_id = TransactionId(1);
         let deposit = Transaction::new(transaction_id, amount);
-        let dispute = Dispute::new(transaction_id);
 
         bank.transact(client, deposit.clone())?;
-        bank.handle_dispute(client, dispute.clone())?;
-        bank.resolve_dispute(client, dispute)?;
+        bank.dispute_transaction(client, transaction_id.clone())?;
+        bank.resolve_disputed_transaction(client, transaction_id)?;
 
         assert_eq!(bank.account(client).available, amount);
         assert_eq!(bank.account(client).held, Decimal::zero());
@@ -556,23 +546,21 @@ mod test {
                 .unwrap(),
             deposit
         );
-        assert!(bank.account(client).open_disputes.is_empty());
+        assert!(bank.account(client).disputed_transactions.is_empty());
         Ok(())
     }
 
     #[test]
-    fn chargeback_correctly_pulls_back_disputed_transaction(
-    ) -> Result<(), Box<dyn Error>> {
+    fn chargeback_correctly_pulls_back_disputed_transaction() -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let amount = Decimal::max_value();
         let transaction_id = TransactionId(1);
         let deposit = Transaction::new(transaction_id, amount);
-        let dispute = Dispute::new(transaction_id);
 
         bank.transact(client, deposit.clone())?;
-        bank.handle_dispute(client, dispute.clone())?;
-        bank.chargeback(client, dispute)?;
+        bank.dispute_transaction(client, transaction_id.clone())?;
+        bank.chargeback(client, transaction_id)?;
 
         assert_eq!(bank.account(client).available, Decimal::zero());
         assert_eq!(bank.account(client).held, Decimal::zero());
@@ -584,14 +572,13 @@ mod test {
                 .unwrap(),
             deposit
         );
-        assert!(bank.account(client).open_disputes.is_empty());
+        assert!(bank.account(client).disputed_transactions.is_empty());
         assert!(bank.account(client).locked);
         Ok(())
     }
 
     #[test]
-    fn chargeback_correctly_ignored_if_transaction_not_disputed(
-    ) -> Result<(), Box<dyn Error>> {
+    fn chargeback_correctly_ignored_if_transaction_not_disputed() -> Result<(), TransactorError> {
         let mut bank = Bank::new();
         let client = ClientId(1);
         let amount = Decimal::max_value();
@@ -599,7 +586,7 @@ mod test {
         let deposit = Transaction::new(transaction_id, amount);
 
         bank.transact(client, deposit.clone())?;
-        bank.chargeback(client, Dispute::new(transaction_id))?;
+        bank.chargeback(client, transaction_id)?;
 
         assert_eq!(bank.account(client).available, amount);
         assert_eq!(bank.account(client).held, Decimal::zero());
@@ -611,7 +598,7 @@ mod test {
                 .unwrap(),
             deposit
         );
-        assert!(bank.account(client).open_disputes.is_empty());
+        assert!(bank.account(client).disputed_transactions.is_empty());
         assert!(!bank.account(client).locked);
         Ok(())
     }

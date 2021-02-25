@@ -2,12 +2,13 @@ use argh::FromArgs;
 use csv::{ReaderBuilder, Trim, Writer};
 use rust_decimal::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::error::Error;
 
 mod bank;
+mod error;
 
-use crate::bank::{Bank, ClientId, Dispute, Transaction, TransactionId};
-use simple_error::SimpleError;
+use crate::bank::{Bank, ClientId, Transaction, TransactionId};
+use crate::error::TransactorError;
+use crate::error::TransactorError::*;
 
 #[derive(FromArgs)]
 /// A program for enacting a CSV files of transactions over multiple accounts
@@ -55,60 +56,49 @@ struct AccountRecord {
     locked: bool,
 }
 
-fn enact_transactions(filename: String) -> Result<(), Box<dyn Error>> {
+fn enact_transactions(filename: String) -> Result<(), TransactorError> {
     let mut reader = ReaderBuilder::new().trim(Trim::All).from_path(filename)?;
     let mut bank: Bank = Bank::new();
     for result in reader.deserialize() {
-        let transaction: TransactionRecord = result?;
-        match transaction.r#type {
+        let record: TransactionRecord = result?;
+        match record.r#type {
             TransactionRecordType::DEPOSIT => {
-                let amount = transaction.amount.ok_or_else(missing_data)?;
+                let amount = record.amount.ok_or_else(missing_data)?;
                 if amount < Decimal::zero() {
-                    return Err(invalid_data());
+                    return Err(InvalidData(
+                        "Deposit of negative amount attempted".to_string(),
+                    ));
                 } else {
                     bank.transact(
-                        ClientId(transaction.client),
-                        Transaction::new(TransactionId(transaction.tx), amount),
+                        ClientId(record.client),
+                        Transaction::new(TransactionId(record.tx), amount),
                     )?;
                 }
             }
             TransactionRecordType::WITHDRAWAL => {
-                let amount = transaction.amount.ok_or_else(missing_data)?;
+                let amount = record.amount.ok_or_else(missing_data)?;
                 if amount < Decimal::zero() {
-                    return Err(invalid_data());
+                    return Err(InvalidData(
+                        "Withdrawal of a negative amount attempted".to_string(),
+                    ));
                 } else {
                     bank.transact(
-                        ClientId(transaction.client),
-                        Transaction::new(TransactionId(transaction.tx), -amount),
+                        ClientId(record.client),
+                        Transaction::new(TransactionId(record.tx), -amount),
                     )?;
                 }
             }
             TransactionRecordType::DISPUTE => {
-                if transaction.amount.is_some() {
-                    return Err(invalid_data());
-                }
-                bank.handle_dispute(
-                    ClientId(transaction.client),
-                    Dispute::new(TransactionId(transaction.tx)),
-                )?;
+                let (client, transaction) = parse_dispute_type_record(record)?;
+                bank.dispute_transaction(client, transaction)?;
             }
             TransactionRecordType::RESOLVE => {
-                if transaction.amount.is_some() {
-                    return Err(invalid_data());
-                }
-                bank.resolve_dispute(
-                    ClientId(transaction.client),
-                    Dispute::new(TransactionId(transaction.tx))
-                )?;
+                let (client, transaction) = parse_dispute_type_record(record)?;
+                bank.resolve_disputed_transaction(client, transaction)?;
             }
             TransactionRecordType::CHARGEBACK => {
-                if transaction.amount.is_some() {
-                    return Err(invalid_data());
-                }
-                bank.chargeback(
-                    ClientId(transaction.client),
-                    Dispute::new(TransactionId(transaction.tx))
-                )?;
+                let (client, transaction) = parse_dispute_type_record(record)?;
+                bank.chargeback(client, transaction)?;
             }
         }
     }
@@ -118,19 +108,30 @@ fn enact_transactions(filename: String) -> Result<(), Box<dyn Error>> {
             client: account.client_id.0,
             available: account.available.round_dp(4).normalize(),
             held: account.held.round_dp(4).normalize(),
-            total: account.available.checked_add(account.held).ok_or_else(|| {
-                SimpleError::new("Overflow calculating total funds associated to account")
-            })?.round_dp(4).normalize(),
+            total: account
+                .available
+                .checked_add(account.held)
+                .ok_or_else(|| Overflow)?
+                .round_dp(4)
+                .normalize(),
             locked: account.locked,
         })?;
     }
     Ok(())
 }
 
-fn missing_data() -> SimpleError {
-    SimpleError::new("Missing data in record")
+fn parse_dispute_type_record(
+    record: TransactionRecord,
+) -> Result<(ClientId, TransactionId), TransactorError> {
+    if record.amount.is_some() {
+        return Err(InvalidData(
+            "Found amount in non-transaction type record".to_string(),
+        ));
+    } else {
+        Ok((ClientId(record.client), TransactionId(record.tx)))
+    }
 }
 
-fn invalid_data() -> Box<dyn Error> {
-    Box::new(SimpleError::new("Invalid data passed into program"))
+fn missing_data() -> TransactorError {
+    InvalidData("Missing field in input".to_string())
 }
