@@ -1,3 +1,7 @@
+## Requirements
+
+
+
 ## Dependencies
 I am using csv and serde for reading and writing from csv files as suggested. For the decimal number handling 
 I have gone with rust_decimal because it handles fixed precision calculations according to its documentation - 
@@ -14,6 +18,7 @@ set of tests are more usual cargo testing in the project itself which witness sp
 * TODO: Since clients do not interact we can shard based on client id for multi-threading
 
 ## Edge cases
+* Deposit, Withdrawal, Dispute on Deposit
 * Rounding errors on deposits and withdrawals
 * Negative deposits
 * Negative Withdrawals

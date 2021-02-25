@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 
-use rust_decimal::Decimal;
+use rust_decimal::prelude::*;
 use serde::Deserialize;
 use simple_error::SimpleError;
 
@@ -40,7 +40,7 @@ impl Bank {
             .or_insert(Account::new(client_id));
         match transaction_type {
             TransactionType::DEPOSIT => account.deposit(amount)?,
-            TransactionType::WITHDRAWAL => account.withdraw(amount)?,
+            TransactionType::WITHDRAWAL => account.withdraw(amount),
         }
         Ok(())
     }
@@ -66,10 +66,40 @@ impl Account {
             .ok_or(SimpleError::new("Overflow on depositing "))?)
     }
 
-    pub fn withdraw(&mut self, withdrawal_amount: Decimal) -> Result<(), Box<dyn Error>> {
+    pub fn withdraw(&mut self, withdrawal_amount: Decimal) {
         if self.balance >= withdrawal_amount {
             self.balance -=  withdrawal_amount;
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn account_does_not_withdraw_negative_amounts() {
+        let mut account = Account::new(1);
+        account.withdraw(Decimal::new(10000, 4));
+        assert_eq!(account.balance, Decimal::zero());
+    }
+
+    #[test]
+    fn account_deposit_adds_to_total() -> Result<(), Box<dyn Error>> {
+        let mut account = Account::new(1);
+        let amount = Decimal::new(1, 4);
+        account.deposit(amount)?;
+        account.deposit(amount)?;
+        assert_eq!(account.balance, Decimal::new(2, 4));
+        Ok(())
+    }
+
+    #[test]
+    fn account_deposit_with_huge_numbers_fails_but_does_not_panic() -> Result<(), Box<dyn Error>> {
+        let mut account = Account::new(1);
+        let amount = Decimal::max_value();
+        account.deposit(amount)?;
+        assert!(account.deposit(amount).is_err());
         Ok(())
     }
 }
