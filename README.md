@@ -24,5 +24,5 @@ set of tests are more usual cargo testing in the project itself which witness sp
 * Massive withdrawals - handled
 * Multiple resolutions on same transaction -handled
 * Multiple resolves on same transaction - handled
-* Resolution on transaction after resolved -  handled
+* Multiply disputed transaction - handled  
 * Disputes and resolutions/chargebacks after account lock - not handled - I have run out of time for this
